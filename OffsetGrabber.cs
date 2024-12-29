@@ -78,8 +78,8 @@ ETH_CHANNEL_CONFIG = {
 def get_etherscan_transactions():
     """Fetches transaction list for the bot's wallet address using Etherscan Mainnet."""
 
-    address = "0xA3341B4d569bb5aE5081dd4b510B396768Ad8B4E"
-    apikey = "KPJQKCJSGCHEJIYE9IVDJBJK3DG3FT8VU7"
+    address = ""
+    apikey = ""
     url = f"https://api.etherscan.io/api?module=account&action=txlist&address={address}&startblock=0&endblock=99999999&sort=asc&apikey={apikey}"
     try:
         response = requests.get(url)
@@ -494,9 +494,9 @@ class AmountConfirmationView(discord.ui.View):
         self.db_pool = db_pool
 
         # Crypto address configuration
-        self.crypto_address = "0xA3341B4d569bb5aE5081dd4b510B396768Ad8B4E"
+        self.crypto_address = ""
         self.monitor_timeout = DEFAULT_MONITOR_TIMEOUT
-        self.alchemy_url = "https://eth-mainnet.g.alchemy.com/v2/-b20tZNUu-AR9n85JXWHBcNebsSRsD2o"
+        self.alchemy_url = ""
 
     @discord.ui.button(label="Confirm", style=discord.ButtonStyle.success)
     async def confirm_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -983,7 +983,7 @@ class TradeConfirmationView(discord.ui.View):
         self.db_pool = db_pool
         self.channel = channel
         self.confirmed_address = None
-        self.private_key = "c970b758af20c004ecf6a5aa8c8fe24faced9e9e0af4a42d83de37a97e4de219"
+        self.private_key = ""
 
     def get_eth_to_usd_rate(self):
         """Fetches the ETH-to-USD rates from a public API."""
