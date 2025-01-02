@@ -1,29 +1,41 @@
+
 import os
-import re
 import asyncio
 import asyncpg
+import re
 import qrcode
 import logging
+import aiohttp
 import requests
 from decimal import Decimal
 from datetime import datetime, timedelta
+from datetime import timezone
 from asyncio import Lock
+
+from blockcypher import simple_spend, from_base_unit
 
 from Utils.check_wallet_balance import check_wallet_balance
 from Utils.fee_charges import calculate_fee
+
+from ecdsa import SigningKey, SECP256k1
+from hashlib import sha256
+
+from bit.exceptions import InsufficientFunds
+
+from pycoin.symbols.ltc import network as ltc_network
 
 import discord
 from discord.ext import commands
 from discord.ui import View, Button
 from dotenv import load_dotenv
-from web3 import Web3
-from web3.exceptions import TransactionNotFound
+from scripts.commands.privacy import anonymous_users, anonymous_receivers
 
 from Database.postgres import (
     initialize_db,
     add_ticket,
     update_ticket_status,
     get_ticket,
+    update_ticket_amount,
     update_ticket_fields,
     update_user_data,
     update_ticket_transaction_hash,
@@ -33,23 +45,44 @@ from Database.postgres import (
     update_return_transaction_hash,
     get_user_wallet_address,
     validate_ethereum_address,
+    add_processed_transaction,
+    get_processed_transactions,
     ensure_pool
 )
 
+# Default timeout for transaction monitoring
 DEFAULT_MONITOR_TIMEOUT = int(os.getenv("TRANSACTION_MONITOR_TIMEOUT", 5))
 
-# Load environment variables
+# Load environment v
 load_dotenv()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Initialize Web3 instance
-w3 = Web3(Web3.HTTPProvider("https://eth-mainnet.g.alchemy.com/v2/-b20tZNUu-AR9n85JXWHBcNebsSRsD2o"))
+# BlockCypher API Configuration
+BLOCKCYPHER_BASE_URL = "https://api.blockcypher.com/v1/ltc/main"
+BLOCKCYPHER_API_TOKEN = "4494713e9fee4fc28c4e2f37088e1f1d"
 
-if not w3.is_connected():
-    raise ConnectionError("Unable to connect to Ethereum network.")
+FROM_ADDRESS = "LMWPbWSahWAZuHsbJQecHgkv4WboQbX6vZ" 
+PRIVATE_KEY = "T3YXxnfCrpBevCUU7RACq1Gb1RJdBubuSs6ZQFJTJA3kS35eyc9w"
+
+TATUM_API_BASE_URL = "https://litecoin-mainnet.gateway.tatum.io"
+
+# Test connection to BlockCypher API
+def test_blockcypher_connection():
+    try:
+        response = requests.get(f"{BLOCKCYPHER_BASE_URL}?token={BLOCKCYPHER_API_TOKEN}")
+        if response.status_code == 200:
+            logger.info("Connected to Litecoin network via BlockCypher.")
+        else:
+            logger.error(f"Failed to connect to Litecoin network: {response.text}")
+            raise ConnectionError("Unable to connect to Litecoin network.")
+    except Exception as e:
+        logger.error(f"Error connecting to Litecoin network: {e}")
+        raise
+
+test_blockcypher_connection()
 
 # Database Setup
 async def setup_postgres():
@@ -63,36 +96,41 @@ async def setup_postgres():
         logger.error(f"Failed to set up PostgreSQL database: {e}")
         raise
 
-# Ethereum Channel Configuration
-ETH_CHANNEL_CONFIG = {
-    "ETH": {
+# Configuration specifically for Litecoin (LTC)
+LTC_CHANNEL_CONFIG = {
+    "LTC": {
         "embed": discord.Embed(
-            title="Ethereum Support",
-            description="You have chosen Ethereum. Please wait while we connect you with a support representative.",
-            color=discord.Color.blue()
-        )
-        .set_thumbnail(url="https://seeklogo.com/images/E/ethereum-logo-EC6CDBA45B-seeklogo.com.png")
+            title="Litecoin Support",
+            description="You have chosen Litecoin. Please wait while we connect you with a support representative.",
+            color=discord.Color.light_grey()
+        ) .set_thumbnail(url="https://seeklogo.com/images/L/litecoin-ltc-logo-504C7EF8DA-seeklogo.com.png")
     }
 }
 
-def get_etherscan_transactions():
-    """Fetches transaction list for the bot's wallet address using Etherscan Mainnet."""
 
-    address = ""
-    apikey = ""
-    url = f"https://api.etherscan.io/api?module=account&action=txlist&address={address}&startblock=0&endblock=99999999&sort=asc&apikey={apikey}"
-    try:
-        response = requests.get(url)
-        response.raise_for_status()
-        data = response.json()
-        if data["status"] == "1" and data["result"]:
-            return data["result"]
-        else:
-            logger.warning(f"Etherscan API returned no transactions: {data.get('message', 'Unknown error')}")
-            return []
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Failed to fetch transactions from Etherscan: {e}")
-        return []
+def get_blockcypher_transactions(crypto_address):
+    """Fetch transactions from the BlockCypher API with rate-limit handling."""
+
+    address = "LMWPbWSahWAZuHsbJQecHgkv4WboQbX6vZ"
+    api_token = "4494713e9fee4fc28c4e2f37088e1f1d"
+
+    url = f"{BLOCKCYPHER_BASE_URL}/addrs/{address}/full?token={api_token}"
+    for attempt in range(3):  # Try up to 3 times
+        try:
+            response = requests.get(url)
+            if response.status_code == 200:
+                data = response.json()
+                return data.get("txs", [])
+            elif response.status_code == 429:  # Too Many Requests
+                logger.warning("Rate limit reached. Retrying...")
+            else:
+                logger.error(f"Unexpected error: {response.json()}")
+            time.sleep(2 ** attempt)  # Exponential backoff
+        except requests.RequestException as e:
+            logger.error(f"Error fetching transactions: {e}")
+    logger.error("Failed to fetch transactions after retries.")
+    return []
+
 
 # Persistent Views Registration
 class TicketBot(commands.Bot):
@@ -247,7 +285,7 @@ class DeleteConfirmationView(discord.ui.View):
             await interaction.response.send_message("Only the ticket creator can continue the ticket.", ephemeral=True)
 
 class RoleSelectionView(discord.ui.View):
-    def __init__(self, bot: commands.Bot, user: discord.User, mentioned_user: discord.User, ticket_view, ticket_id: int, channel: discord.TextChannel):
+    def __init__(self, bot: commands.Bot, user: discord.User, mentioned_user: discord.User, ticket_view, ticket_id: int, channel: discord.TextChannel, db_pool):
         super().__init__(timeout=None)
         self.bot = bot
         self.user = user
@@ -256,6 +294,7 @@ class RoleSelectionView(discord.ui.View):
         self.selection_made = False
         self.ticket_id = int(ticket_id)
         self.channel = channel
+        self.db_pool = db_pool
 
     @discord.ui.button(label="Sender", style=discord.ButtonStyle.green)
     async def sender_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -297,13 +336,13 @@ class RoleSelectionView(discord.ui.View):
             receiver=receiver,
             confirm_user=self.mentioned_user,
             ticket_id=self.channel.id,  
-            ticket_view=self.ticket_view
+            ticket_view=self.ticket_view,
+            db_pool=self.db_pool 
         )
         await interaction.channel.send(embed=confirmation_embed, view=role_confirm_view)
 
-
 class RoleConfirmView(discord.ui.View):
-    def __init__(self, bot, sender, receiver, confirm_user, ticket_id, ticket_view):
+    def __init__(self, bot, sender, receiver, confirm_user, ticket_id, ticket_view, db_pool):
         super().__init__(timeout=None)
         self.bot = bot
         self.sender = sender
@@ -311,6 +350,7 @@ class RoleConfirmView(discord.ui.View):
         self.confirm_user = confirm_user  # Only this user can confirm or deny roles
         self.ticket_id = ticket_id
         self.ticket_view = ticket_view
+        self.db_pool = db_pool
 
     @discord.ui.button(label="Confirm", style=discord.ButtonStyle.success)
     async def confirm_roles(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -326,6 +366,18 @@ class RoleConfirmView(discord.ui.View):
         self.ticket_view.roles_confirmed = True  # Mark roles as confirmed
         await self.ticket_view.disable_cancel_button(interaction)  # Disable cancel button
         await self.finalize_role_selection(interaction)
+         
+        # Store sender and receiver in the database
+        try:
+            await update_ticket_fields(
+                pool=self.ticket_view.db_pool,
+                channel_id=self.ticket_id,
+                sender_id=str(self.sender.id),
+                receiver_id=str(self.receiver.id)
+            )
+            logger.info(f"Sender and receiver updated for ticket {self.ticket_id}.")
+        except Exception as e:
+            logger.error(f"Failed to update sender and receiver in the database: {e}")
 
     @discord.ui.button(label="Deny", style=discord.ButtonStyle.danger)
     async def deny_roles(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -387,7 +439,8 @@ class RoleConfirmView(discord.ui.View):
             mentioned_user=self.receiver,  # Keep the original receiver as the mentioned user
             ticket_view=self.ticket_view,
             ticket_id=channel.id,
-            channel=channel
+            channel=channel,
+            db_pool=self.db_pool
         )
         await channel.send(embed=role_selection_embed, view=role_selection_view)
 
@@ -442,7 +495,7 @@ class RoleConfirmView(discord.ui.View):
         except ValueError:
             error_embed = discord.Embed(
                 title="Invalid Format",
-                description="The amount entered is not valid. Please use a format like `$1000.00` or `1000`.",
+                description="The amount entered is not valid. Please use a format like $1000.00 or 1000.",
                 color=discord.Color.red()
             )
             await channel.send(embed=error_embed)
@@ -471,6 +524,7 @@ class RoleConfirmView(discord.ui.View):
             ticket_view=self.ticket_view,
             db_pool=self.bot.database_pool
         )
+        await update_ticket_amount(self.db_pool, self.ticket_id, amount)
         await channel.send(embed=confirm_embed, view=confirmation_view)
     
     @staticmethod
@@ -492,11 +546,11 @@ class AmountConfirmationView(discord.ui.View):
         self.ticket_view = ticket_view
         self.expected_amount = amount
         self.db_pool = db_pool
+        self.use_pass_lock = asyncio.Lock()
 
         # Crypto address configuration
-        self.crypto_address = ""
+        self.crypto_address = "LMWPbWSahWAZuHsbJQecHgkv4WboQbX6vZ"
         self.monitor_timeout = DEFAULT_MONITOR_TIMEOUT
-        self.alchemy_url = ""
 
     @discord.ui.button(label="Confirm", style=discord.ButtonStyle.success)
     async def confirm_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -570,9 +624,12 @@ class AmountConfirmationView(discord.ui.View):
 
         async def use_pass_callback(interaction: discord.Interaction):
             """Handles the logic when 'Use Pass' is clicked."""
-            if interaction.user.id not in [self.ticket_owner.id, self.mentioned_user.id]:
-                await interaction.response.send_message("Only the ticket participants can use a pass.", ephemeral=True)
-                return
+            async with self.use_pass_lock:  # Ensure only one user can execute this at a time
+                if interaction.user.id not in [self.ticket_owner.id, self.mentioned_user.id]:
+                    await interaction.response.send_message(
+                        "Only the ticket participants can use a pass.", ephemeral=True
+                    )
+                    return
 
             try:
                 passes = await get_user_passes(self.db_pool, str(interaction.user.id))
@@ -641,7 +698,6 @@ class AmountConfirmationView(discord.ui.View):
                 channel=channel,
                 crypto_address=self.crypto_address,
                 expected_amount=self.expected_amount,
-                alchemy_url=self.alchemy_url,
                 monitor_timeout=self.monitor_timeout,
                 db_pool=self.db_pool,
                 ticket_id=self.ticket_id,
@@ -667,29 +723,34 @@ async def reconnect_db(pool):
         raise
 
 class TransactionMonitor:
-    def __init__(self, bot, channel, crypto_address, expected_amount, alchemy_url, monitor_timeout, db_pool, ticket_id, sender, receiver):
+    def __init__(self, bot, channel, crypto_address, expected_amount, monitor_timeout, db_pool, ticket_id, sender, receiver):
         self.bot = bot
         self.channel = channel
-        self.crypto_address = Web3.to_checksum_address(crypto_address)
+        self.crypto_address = crypto_address
         self.expected_amount = Decimal(expected_amount)
-        self.w3 = Web3(Web3.HTTPProvider("https://eth-mainnet.g.alchemy.com/v2/-b20tZNUu-AR9n85JXWHBcNebsSRsD2o"))  # Initialize Web3 with Alchemy URL
-        self.monitor_timeout = monitor_timeout
+        self.monitor_timeout = 30  # Updated timeout to 30 minutes
         self.db_pool = db_pool
         self.ticket_id = ticket_id
         self.sender = sender
         self.receiver = receiver
-        self.eth_to_usd_rate = None
-        self.detection_message = None
-        self.crypto_prompt_sent = False
+        self.ltc_to_usd_rate = None
+        self.transaction_detected_message = None  # To store the detection message reference
+        self.confirmation_message = None  # To store the confirmation message reference
         self.transaction_confirmed = False
         self._lock = Lock()
-        self.processed_transactions = set()
+        self.processed_transactions = set()  # Keep track of processed transaction hashes
 
-        if not self.w3.is_connected():
-            raise ConnectionError("Unable to connect to the Ethereum network. Check your connection.")
+    async def load_processed_transactions(self):
+        """Load processed transaction hashes from the database."""
+        try:
+            self.processed_transactions = await get_processed_transactions(self.db_pool, self.ticket_id)
+            logger.info(f"Loaded processed transactions for ticket {self.ticket_id}: {self.processed_transactions}")
+        except Exception as e:
+            logger.error(f"Error loading processed transactions: {e}")
+            self.processed_transactions = set()
 
     def generate_qr_code(self):
-        """Generates a QR code for the bot's Ethereum wallet address and saves it."""
+        """Generates a QR code for the bot's Litecoin wallet address and saves it."""
         output_dir = "assets/qrcodes"
         os.makedirs(output_dir, exist_ok=True)  # Ensure the output directory exists
 
@@ -702,250 +763,276 @@ class TransactionMonitor:
         img.save(qr_code_path)
         return qr_code_path
 
-    async def _send_crypto_address_prompt(self, channel: discord.TextChannel):
-        """Sends the crypto address for the transaction and shows monitoring embed."""
-        if self.crypto_prompt_sent:  # Ensure prompt is sent only once
-            logger.info("Crypto address prompt already sent; skipping.")
-            return
-
-        # Record the current block number accurately
-        self.start_block = self.w3.eth.block_number
-        logger.info(f"Recorded starting block number: {self.start_block}.")
-
-        qr_code_path = self.generate_qr_code()
-        address_prompt_embed = discord.Embed(
-            title="Send the Cryptocurrency",
-            description=(
-                f"Please send **${self.expected_amount:,.2f}** to the following address:\n\n`{self.crypto_address}`\n\n"
-                "**Important:** Spillage is **1%**, so ensure you send the exact amount; otherwise, the bot won't detect it. "
-                "Once sent, the bot will verify the amount.\n\n"
-                "If you have any issues, please contact support."
-            ),
-            color=discord.Color.blue()
-        ).set_footer(text="Monitoring transactions...").set_thumbnail(url="attachment://qr_code.png")
-
-        file = discord.File(qr_code_path, filename="qr_code.png")
-        self.paste_view = discord.ui.View(timeout=None)
-        paste_button = discord.ui.Button(label="Paste Address", style=discord.ButtonStyle.primary)
-
-        async def paste_callback(interaction: discord.Interaction):
-            await interaction.response.send_message(self.crypto_address, ephemeral=True)
-
-        paste_button.callback = paste_callback
-        self.paste_view.add_item(paste_button)
-
-        self.crypto_prompt_sent = True
-        self.detection_message = await channel.send(embed=address_prompt_embed, file=file, view=self.paste_view)
-
-    def get_eth_to_usd_rate(self):
-        """Fetches the ETH-to-USD rate sfrom a public API."""
-        try:
-            response = requests.get("https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd")
-            response.raise_for_status()
-            eth_to_usd = response.json()["ethereum"]["usd"]
-            logger.info(f"ETH-to-USD rate fetched: {eth_to_usd}")
-            return eth_to_usd
-        except Exception as e:
-            logger.error(f"Error fetching ETH-to-USD rate: {e}")
-            return None
-
-    async def send_awaiting_embed(self, channel: discord.TextChannel):
-        """Sends an embed to notify the channel of the transaction monitoring."""
-        embed = discord.Embed(
-            title="Awaiting Transaction",
-            description=(
-                f"Monitoring the blockchain for a transaction of **${self.expected_amount:.2f} USD**.\n"
-                "Ensure you send the correct amount to the specified address.\n\n"
-                f"**Address:** `{self.crypto_address}`"),
-            color=discord.Color.orange()
-        )
-        self.detection_message = await channel.send(embed=embed)
-
     async def monitor_transactions(self):
-        """Monitor transactions using Etherscan API."""
-        logger.info(f"Starting transaction monitoring for ticket ID {self.ticket_id}.")
-
+        """Monitor transactions on BlockCypher."""
         try:
-            if not hasattr(self, 'processed_transactions'):
-                self.processed_transactions = set()
+            await self.load_processed_transactions()
 
-            if not hasattr(self, 'start_block') or self.start_block is None:
-                self.start_block = self.w3.eth.block_number
-                logger.info(f"Automatically set starting block number: {self.start_block}")
-
-            # Send the crypto address embed once and record the embed sent time
-            await self._send_crypto_address_prompt(self.channel)
-            embed_sent_time = datetime.now()
-
-            # Define monitoring end time
+            await self._send_crypto_address_prompt()
             end_time = datetime.now() + timedelta(minutes=self.monitor_timeout)
+            self.ltc_to_usd_rate = Decimal(self.get_ltc_to_usd_rate())
 
-            # Fetch ETH-to-USD rate as a Decimal
-            eth_to_usd_rate = Decimal(self.get_eth_to_usd_rate())
-            if eth_to_usd_rate is None:
-                logger.error("Failed to fetch ETH-to-USD rate. Aborting transaction monitoring.")
-                await self.channel.send("Unable to retrieve ETH-to-USD conversion rate. Please contact support.")
+            if not self.ltc_to_usd_rate:
+                logger.error("Failed to fetch LTC-to-USD rate. Aborting transaction monitoring.")
+                await self.channel.send("Unable to retrieve LTC-to-USD conversion rate. Please contact support.")
                 return
 
-            logger.info(f"ETH-to-USD conversion rate: {eth_to_usd_rate:.2f} USD/ETH")
-
-            # Calculate expected bounds in USD as Decimal
             lower_bound_usd = Decimal(self.expected_amount) * Decimal("0.99")
             upper_bound_usd = Decimal(self.expected_amount) * Decimal("1.01")
-            logger.info(f"Expected USD range: ${lower_bound_usd:.2f} - ${upper_bound_usd:.2f}.")
 
-            await self.send_awaiting_embed(self.channel)
+            ticket_creation_time = await self.get_ticket_creation_time()
 
             while datetime.now() < end_time:
-                # Check if the transaction has already been confirmed
                 if self.transaction_confirmed:
                     logger.info("Transaction already confirmed. Stopping monitoring.")
                     return
 
-                transactions = get_etherscan_transactions()
-                if not transactions:
-                    logger.info("No transactions retrieved from Etherscan. Retrying...")
-                    await asyncio.sleep(5)
-                    continue
+                transactions = self.get_blockcypher_transactions()
+                logger.debug(f"Fetched transactions: {transactions}")
 
                 for txn in transactions:
-                    # Skip transactions that are already processed
-                    if txn["hash"] in self.processed_transactions:
+                    txn_hash = txn["hash"]
+                    txn_time = datetime.fromisoformat(txn.get("received", "")).replace(tzinfo=timezone.utc)
+                    ticket_creation_time = await self.get_ticket_creation_time()
+
+                    if ticket_creation_time.tzinfo is None:
+                        ticket_creation_time = ticket_creation_time.replace(tzinfo=timezone.utc)
+
+                    if txn_time < ticket_creation_time:
                         continue
 
-                    # Skip transactions in earlier blocks
-                    if int(txn["blockNumber"]) <= self.start_block:
-                        continue
+                    for output in txn.get("outputs", []):
+                        if self.crypto_address in output.get("addresses", []):
+                            value_ltc = Decimal(output["value"]) / Decimal(1e8)
+                            value_usd = value_ltc * Decimal(self.ltc_to_usd_rate)
 
-                    # Check if the transaction timestamp is after the embed was sent
-                    txn_time = datetime.fromtimestamp(int(txn["timeStamp"]))
-                    if txn_time < embed_sent_time:
-                        logger.info(f"Skipping transaction {txn['hash']} before embed was sent at {embed_sent_time}.")
-                        continue
+                            logger.debug(f"Transaction {txn_hash} value: {value_usd:.2f} USD (~{value_ltc:.6f} LTC)")
 
-                    if "to" not in txn or txn["to"] is None:
-                        logger.warning(f"Transaction {txn['hash']} has no 'to' field. Skipping.")
-                        continue
+                            if lower_bound_usd <= value_usd <= upper_bound_usd:
+                                async with self._lock:
+                                    if not self.transaction_confirmed:
+                                        self.processed_transactions.add(txn_hash)
+                                        await add_processed_transaction(self.db_pool, txn_hash, self.ticket_id)
+                                        await self.handle_transaction_detected(txn, txn_hash, value_ltc, value_usd)
+                                        return
 
-                    if txn["to"].lower() != self.crypto_address.lower():
-                        logger.info(f"Transaction {txn['hash']} is not to the monitored address. Skipping.")
-                        continue
+                await asyncio.sleep(30)
 
-                    # Convert transaction value to ETH
-                    try:
-                        value_eth = Decimal(self.w3.from_wei(int(txn["value"]), "ether"))
-                    except Exception as e:
-                        logger.error(f"Error converting transaction value: {e}")
-                        continue
-
-                    transaction_hash = txn["hash"]  # Define transaction_hash here
-                    logger.info(f"Transaction detected: {transaction_hash} - Amount: {value_eth:.6f} ETH.")
-
-                    # Convert ETH to USD for range check
-                    value_usd = value_eth * eth_to_usd_rate
-                    logger.debug(f"Converted transaction value: {value_usd:.2f} USD.")
-
-                    # Check if the transaction value is within bounds (in USD)
-                    if lower_bound_usd <= value_usd <= upper_bound_usd:
-                        logger.info(f"Transaction {transaction_hash} is within the acceptable USD range.")
-
-                        # Prevent duplicate confirmations
-                        async with self._lock:
-                            if not self.transaction_confirmed:
-                                self.transaction_confirmed = True
-
-                                # Add transaction hash to processed transactions
-                                self.processed_transactions.add(transaction_hash)
-                                logger.info(f"Added transaction {transaction_hash} to processed list.")
-
-                                await self.log_and_confirm_transaction(txn, value_eth, value_usd)
-                                return
-                    else:
-                        logger.warning(
-                            f"Transaction value {value_usd:.2f} USD is outside the expected range "
-                            f"(${lower_bound_usd:.2f} - ${upper_bound_usd:.2f})."
-                        )
-
-                # Wait for a brief period before checking again
-                await asyncio.sleep(5)
-
-            # Handle timeout if no transactions are detected
             await self.handle_timeout()
         except Exception as e:
             logger.error(f"Error monitoring transactions: {e}")
             await self.channel.send("Transaction monitoring encountered an error.")
-
-    async def log_and_confirm_transaction(self, txn, value_eth, value_usd):
-        """Logs the relevant transaction and sends confirmation."""
+    
+    async def get_ticket_creation_time(self):
+        """Fetches the ticket creation time from the database."""
         try:
-            txn_hash = txn["hash"]
+            ticket_info = await get_ticket(self.db_pool, self.ticket_id)
+            if ticket_info and ticket_info["created_at"]:
+                created_at = ticket_info["created_at"]
+                if isinstance(created_at, datetime):
+                    return created_at
+                elif isinstance(created_at, str):
+                    return datetime.fromisoformat(created_at)
+                else:
+                    logger.warning(f"Invalid format for created_at: {created_at}. Defaulting to now.")
+                    return datetime.now()
+            else:
+                logger.warning(f"Could not fetch creation time for ticket ID {self.ticket_id}. Defaulting to now.")
+                return datetime.now()
+        except Exception as e:
+            logger.error(f"Error fetching ticket creation time: {e}")
+            return datetime.now()
+    
+    async def _send_crypto_address_prompt(self):
+        """Sends the crypto address for the transaction."""
+        qr_code_path = self.generate_qr_code()
+        address_prompt_embed = discord.Embed(
+            title="Send the Cryptocurrency",
+            description=(
+                f"Please send **${self.expected_amount:,.2f}** to the following address:\n\n{self.crypto_address}\n\n"
+                "**Important:** Spillage is **1%**, so ensure you send the exact amount; otherwise, the bot won't detect it. "
+                "Once sent, the bot will verify the amount.\n\n"
+                "If you have any issues, please contact support."
+            ),
+            color=discord.Color.light_grey()
+        ).set_footer(text="Monitoring transactions...").set_thumbnail(url="attachment://qr_code.png")
 
-            # Log the transaction
-            await add_ticket(
-                pool=self.db_pool,
-                channel_id=self.ticket_id,
-                user_id=str(self.sender.id),
-                amount=float(value_usd),  # Log the amount in USD
-                wallet_address=self.crypto_address,
-                status="Confirmed",
-                transaction_hash=txn_hash,
-                sender_wallet_address=txn.get("from"),
-                receiver_wallet_address=txn.get("to"),
+        file = discord.File(qr_code_path, filename="qr_code.png")
+        paste_button = discord.ui.Button(label="Paste Address", style=discord.ButtonStyle.primary)
+
+        async def copy_address(interaction: discord.Interaction):
+            await interaction.response.send_message(
+                f"{self.crypto_address}", ephemeral=True
             )
-            logger.info(f"Transaction logged: {txn_hash} - {value_usd:.2f} USD for ticket ID {self.ticket_id}.")
-            
-            # Delete the "Awaiting Transaction" message if it exists
-            if hasattr(self, 'detection_message') and self.detection_message:
-                try:
-                    await self.detection_message.delete()
-                    logger.info("Awaiting Transaction message deleted.")
-                except discord.NotFound:
-                    logger.warning("Awaiting Transaction message not found or already deleted.")
 
-            # Send confirmation embed
+        paste_button.callback = copy_address
+        view = discord.ui.View()
+        view.add_item(paste_button)
+
+        self.transaction_detected_message = await self.channel.send(embed=address_prompt_embed, file=file, view=view)
+
+    def get_ltc_to_usd_rate(self):
+        """Fetches the LTC-to-USD rate from CoinGecko."""
+        try:
+            response = requests.get("https://api.coingecko.com/api/v3/simple/price?ids=litecoin&vs_currencies=usd")
+            response.raise_for_status()
+            ltc_to_usd = response.json()["litecoin"]["usd"]
+            logger.info(f"LTC-to-USD rate fetched: {ltc_to_usd}")
+            return ltc_to_usd
+        except Exception as e:
+            logger.error(f"Error fetching LTC-to-USD rate: {e}")
+            return None
+
+    async def handle_transaction_detected(self, txn, txn_hash, value_ltc, value_usd):
+        """Handles transaction detection and updates the confirmation status."""
+        try:
+            embed = discord.Embed(
+                title="Transaction Detected",
+                description=(
+                    f"A transaction matching the expected amount has been detected.\n\n"
+                    f"**Amount:** ${value_usd:.2f} USD (~{value_ltc:.6f} LTC)\n"
+                    f"**Transaction Hash:** {txn_hash}\n\n"
+                    "Confirmations: **0/6**"
+                ),
+                color=discord.Color.orange()
+            )
+            self.transaction_detected_message = await self.channel.send(embed=embed)
+
+            while True:
+                confirmations = self.get_transaction_confirmations(txn_hash)
+                if confirmations >= 1:
+                    await self.handle_transaction_confirmed(txn, txn_hash, value_ltc, value_usd)
+                    return
+                else:
+                    await self.update_confirmation_embed(confirmations)
+                    await asyncio.sleep(30)
+
+        except Exception as e:
+            logger.error(f"Error during transaction detection handling: {e}")
+
+    def get_blockcypher_transactions(self):
+        """Fetch transactions from the BlockCypher API with rate-limit handling."""
+        url = f"{BLOCKCYPHER_BASE_URL}/addrs/{self.crypto_address}/full?token={BLOCKCYPHER_API_TOKEN}"
+
+        for attempt in range(3):  # Try up to 3 times
+            try:
+                response = requests.get(url)
+                if response.status_code == 200:
+                    data = response.json()
+                    return data.get("txs", [])
+                elif response.status_code == 429:  # Too Many Requests
+                    logger.warning("Rate limit reached. Retrying after a delay...")
+                    time.sleep(2 ** attempt)  # Exponential backoff
+                else:
+                    response.raise_for_status()
+            except requests.RequestException as e:
+                logger.error(f"Error fetching transactions from BlockCypher: {e}")
+                time.sleep(2 ** attempt)  # Exponential backoff for other request errors
+        logger.error("Failed to fetch transactions after retries.")
+        return []
+
+    async def handle_transaction_confirmed(self, txn, txn_hash, value_ltc, value_usd):
+        """Handles the transaction confirmation and finalizes the process."""
+        try:
+            # Delete the transaction detected message
+            if self.transaction_detected_message:
+                await self.transaction_detected_message.delete()
+
+            # Save transaction details to the database
+            await self.log_transaction_to_database(txn_hash, value_usd, value_ltc)
+
+            # Send the confirmation embed
             embed = discord.Embed(
                 title="Transaction Confirmed",
                 description=(
-                    f"Bot detected transaction!\n\n"
-                    f"**Amount:** `${value_usd:.2f} USD` (~{value_eth:.6f} ETH)\n\n"
-                    "Your transaction has been successfully confirmed."
+                    f"The transaction has been confirmed.\n\n"
+                    f"**Amount:** ${value_usd:.2f} USD (~{value_ltc:.6f} LTC)\n"
+                    f"**Transaction Hash:** {txn_hash}\n\n"
+                    "Your transaction is complete."
                 ),
-                color=discord.Color.green(),
-            )
-            embed.set_thumbnail(url="https://www.pngkit.com/png/full/776-7762350_download-transparent-check-mark-gif.png")
-            await self.channel.send(embed=embed)
-    
-            # Update ticket with transaction hash
-            await update_ticket_transaction_hash(self.db_pool, self.ticket_id, txn_hash)
-            logger.info(f"Transaction confirmation updated for ticket ID {self.ticket_id}.")
+                color=discord.Color.green()
+            ).set_thumbnail(url="https://www.pngkit.com/png/full/776-7762350_download-transparent-check-mark-gif.png")
 
-            # Instantiate TradeConfirmationView and call initiate_trade_confirmation
-            trade_view = TradeConfirmationView(
+            await self.channel.send(embed=embed)
+
+            # Instantiate trade confirmation view
+            trade_confirmation = TradeConfirmationView(
                 bot=self.bot,
                 sender=self.sender,
                 receiver=self.receiver,
                 ticket_id=self.ticket_id,
                 initial_usd_amount=float(value_usd),
-                w3=self.w3,
                 db_pool=self.db_pool,
-                channel=self.channel,
+                channel=self.channel
             )
-            await trade_view.initiate_trade_confirmation(self.channel)
+            await trade_confirmation.initiate_trade_confirmation(self.channel)
 
         except Exception as e:
-            logger.error(f"Error confirming transaction: {e}")
-            await self.channel.send("An error occurred while confirming the transaction. Please contact support.")
+            logger.error(f"Error handling transaction confirmation: {e}")
 
-    # Enhanced Notifications and Cleanup
-    async def notify_transaction_status(channel, status, description):
-        """Send notification for transaction status."""
-        color = discord.Color.green() if status == "success" else discord.Color.red()
-        embed = discord.Embed(
-            title=f"Transaction {status.capitalize()}",
-            description=description,
-            color=color
-        )
-        await channel.send(embed=embed)
+    def get_transaction_confirmations(self, txn_hash):
+        """Fetches the number of confirmations for a transaction from BlockCypher."""
+        url = f"{BLOCKCYPHER_BASE_URL}/txs/{txn_hash}?token={BLOCKCYPHER_API_TOKEN}"
+        try:
+            response = requests.get(url)
+            if response.status_code == 200:
+                return response.json().get("confirmations", 0)
+            else:
+                logger.warning(f"Failed to fetch confirmations for {txn_hash}: {response.status_code}")
+                return 0
+        except requests.RequestException as e:
+            logger.error(f"Error fetching confirmations: {e}")
+            return 0
+
+    async def update_confirmation_embed(self, confirmations):
+        """Updates the embed with the current number of confirmations."""
+        try:
+            embed = self.transaction_detected_message.embeds[0]
+            embed.description = re.sub(r"Confirmations: \*\*\d+/6\*\*", f"Confirmations: **{confirmations}/1**", embed.description)
+            await self.transaction_detected_message.edit(embed=embed)
+        except discord.NotFound:
+            logger.warning("Transaction detected message not found. Cannot update confirmations.")
+
+    async def log_transaction_to_database(self, txn_hash, value_usd, value_ltc):
+        """Logs the confirmed transaction details to the database."""
+        try:
+            await update_ticket_transaction_hash(self.db_pool, self.ticket_id, txn_hash)
+            await add_ticket(
+                pool=db_pool,
+                channel_id=channel_id,
+                user_id=user_id,
+                amount=amount,
+                wallet_address=wallet_address,
+                status=status,
+                transaction_hash=transaction_hash,
+                sender_wallet_address=sender_wallet,  # Add wallet address
+                sender_id=sender_id,                  # Add sender ID
+                receiver_wallet_address=receiver_wallet,  # Add receiver wallet
+                receiver_id=receiver_id               # Add receiver ID
+            )
+
+            logger.info(f"Transaction {txn_hash} logged successfully in database.")
+        except Exception as e:
+            logger.error(f"Error logging transaction to database: {e}")
+
+    async def fetch_processed_transactions(self):
+        """Fetch previously processed transactions for the current ticket."""
+        try:
+            # Fetch ticket information for the current ticket ID
+            records = await get_ticket(self.db_pool, self.ticket_id)
+        
+            # Ensure records is a list of dictionaries or a similar structure
+            if not records:
+                return set()  # No transactions found
+        
+            # Extract transaction hashes from the fetched records
+            return {
+                record['transaction_hash'] for record in records
+                if isinstance(record, dict) and 'transaction_hash' in record and record['transaction_hash']
+            }
+        except Exception as e:
+            logger.error(f"Error fetching processed transactions for ticket ID {self.ticket_id}: {e}")
+            return set()
 
     async def handle_timeout(self):
         """Handles a timeout if no transaction is detected."""
@@ -960,41 +1047,71 @@ class TransactionMonitor:
         )
         await self.channel.send(embed=embed)
 
-async def remove_use_pass_embed(self):
-    """Removes the 'Use Pass' embed and buttons from the channel."""
-    if hasattr(self, "use_pass_message"):
-        try:
-            await self.use_pass_message.delete()
-        except discord.NotFound:
-            logger.warning("The 'Use Pass' message was already deleted or not found.")
+    async def display_use_pass_options(self):
+        """Displays options to use a pass or proceed with fees."""
+        fee = calculate_fee(float(self.expected_amount))
+        total_amount = self.expected_amount + Decimal(fee)
+
+        embed = discord.Embed(
+            title="Use Pass?",
+            description=(f"Your total amount (including fees) is **${total_amount:.2f}**.\n"
+                         "Do you want to use a pass? This will waive the fees.\n\n"
+                         "**Either of you can use your passes!**\n\n"
+                         "Click the button below to confirm using your pass or proceed with fees."),
+            color=discord.Color.green()
+        )
+
+        view = discord.ui.View()
+        view.add_item(self.create_use_pass_button(fee))
+        view.add_item(self.create_proceed_button(fee))
+
+        await self.channel.send(embed=embed, view=view)
+
+    async def remove_use_pass_embed(self):
+        """Removes the 'Use Pass' embed and buttons from the channel."""
+        if hasattr(self, "use_pass_message"):
+            try:
+                await self.use_pass_message.delete()
+            except discord.NotFound:
+                logger.warning("The 'Use Pass' message was already deleted or not found.")
+
+    async def notify_transaction_status(self, channel, status, description):
+        """Send notification for transaction status."""
+        color = discord.Color.green() if status == "success" else discord.Color.red()
+        embed = discord.Embed(
+            title=f"Transaction {status.capitalize()}",
+            description=description,
+            color=color
+        )
+        await channel.send(embed=embed)
 
 class TradeConfirmationView(discord.ui.View):
-    def __init__(self, bot: commands.Bot, sender: discord.User, receiver: discord.User, ticket_id: int, initial_usd_amount: float, w3: Web3, db_pool, channel: discord.TextChannel):
+    def __init__(self, bot: commands.Bot, sender: discord.User, receiver: discord.User, ticket_id: int, initial_usd_amount: float, db_pool, channel: discord.TextChannel):
         super().__init__(timeout=None)
         self.bot = bot
         self.sender = sender
         self.receiver = receiver
         self.ticket_id = ticket_id
         self.initial_usd_amount = initial_usd_amount  # The initially agreed USD amount
-        self.eth_amount = None  # This will store the equivalent ETH amount after conversion
+        self.ltc_amount = None  # This will store the equivalent LTC amount after conversion
         self.release_message = None  # To store the "Release" message reference
         self.confirmation_message = None  # To store the transaction confirmation message reference
-        self.w3 = w3
         self.db_pool = db_pool
         self.channel = channel
         self.confirmed_address = None
-        self.private_key = ""
+        self.crypto_address = "LMWPbWSahWAZuHsbJQecHgkv4WboQbX6vZ"
+        self.private_key = "T3YXxnfCrpBevCUU7RACq1Gb1RJdBubuSs6ZQFJTJA3kS35eyc9w"
 
-    def get_eth_to_usd_rate(self):
-        """Fetches the ETH-to-USD rates from a public API."""
+    def get_ltc_to_usd_rate(self):
+        """Fetches the LTC-to-USD rates from a public API."""
         try:
-            response = requests.get("https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd")
+            response = requests.get("https://api.coingecko.com/api/v3/simple/price?ids=litecoin&vs_currencies=usd")
             response.raise_for_status()
-            eth_to_usd = response.json()["ethereum"]["usd"]
-            logger.info(f"ETH-to-USD rate fetched: {eth_to_usd}")
-            return eth_to_usd
+            ltc_to_usd = response.json()["litecoin"]["usd"]
+            logger.info(f"LTC-to-USD rate fetched: {ltc_to_usd}")
+            return ltc_to_usd
         except Exception as e:
-            logger.error(f"Error fetching ETH-to-USD rate: {e}")
+            logger.error(f"Error fetching LTC-to-USD rate: {e}")
             return None
 
     async def initiate_trade_confirmation(self, channel: discord.TextChannel):
@@ -1041,24 +1158,38 @@ class TradeConfirmationView(discord.ui.View):
             except discord.NotFound:
                 pass  # Message already deleted or not found
 
-        # Prompt the sender to enter an address for the ETH transfer of the full received amount
-        await self.prompt_for_eth_address(interaction.channel)
+        # Prompt the sender to enter an address for the LTC transfer of the full received amount
+        await self.prompt_for_ltc_address(interaction.channel)
 
-    async def prompt_for_eth_address(self, channel: discord.TextChannel):
-        """Prompts the receiver to enter the Ethereum address to receive the full amount in ETH equivalent of the USD value."""
-        # Convert the initial USD amount to ETH
-        eth_to_usd_rate = self.get_eth_to_usd_rate()
-        if eth_to_usd_rate is None:
-            await channel.send("Failed to retrieve the ETH to USD conversion rate. Please try again later or contact support.")
+    def is_valid_ltc_address(self, address: str) -> bool:
+        # Define valid prefixes
+        valid_prefixes = ("L", "M")
+        min_length = 26  # Minimum possible Litecoin address length
+
+        return (
+            isinstance(address, str)
+            and len(address) >= min_length
+            and address.startswith(valid_prefixes)
+        )
+
+    async def prompt_for_ltc_address(self, channel: discord.TextChannel):
+        """
+        Prompts the receiver to enter the Litecoin address to receive the full amount in LTC equivalent of the USD value.
+        """
+        # Convert the initial USD amount to LTC
+        ltc_to_usd_rate = self.get_ltc_to_usd_rate()
+        if ltc_to_usd_rate is None:
+            await channel.send("Failed to retrieve the LTC to USD conversion rate. Please try again later or contact support.")
             return
 
-        self.eth_amount = self.initial_usd_amount / eth_to_usd_rate
+        self.ltc_amount = self.initial_usd_amount / ltc_to_usd_rate
 
         address_prompt_embed = discord.Embed(
-            title="Enter ETH Address",
+            title="Enter LTC Address",
             description=(
-                f"{self.receiver.mention}, please provide your Ethereum wallet address where you would like to receive "
-                f"the equivalent of **${self.initial_usd_amount:.2f} USD** (~{self.eth_amount:.6f} ETH)."
+                f"{self.receiver.mention}, please provide your Litecoin wallet address where you would like to receive "
+                f"the equivalent of **${self.initial_usd_amount:.2f} USD** (~{self.ltc_amount:.6f} LTC).\n\n"
+                "**Important Note:** Legacy addresses (starting with ltc1) are not supported."
             ),
             color=discord.Color.blue()
         )
@@ -1070,29 +1201,31 @@ class TradeConfirmationView(discord.ui.View):
             except discord.NotFound:
                 pass
 
-        # Keep reprompting until the user confirms a valid address
+        # Keep prompting until the user confirms a valid address
         while True:
-            address_message = await channel.send(embed=address_prompt_embed)
+            await channel.send(embed=address_prompt_embed)
 
             # Wait for the user to provide an address
             def address_check(message):
-                return message.author == self.receiver and message.channel == channel
+                return (
+                    message.author == self.receiver
+                    and message.channel == channel
+                    and self.is_valid_ltc_address(message.content.strip())
+                )
 
-            address_message_content = await self.bot.wait_for("message", check=address_check)
-            address = address_message_content.content.strip()
+            try:
+                address_message = await self.bot.wait_for("message", check=address_check)
+                address = address_message.content.strip()
 
-            if Web3.is_address(address):
-                # Send confirmation embed with buttons
+                # Confirm the valid address with the user
                 confirmation_embed = discord.Embed(
-                    title="Confirm Ethereum Address",
-                    description=(
-                        f"{self.receiver.mention}, are you sure you want to receive the funds at this address?\n\n"
-                        f"**Address:** `{address}`"
-                    ),
+                    title="Confirm Litecoin Address",
+                    description=(f"{self.receiver.mention}, are you sure you want to receive the funds at this address?\n\n"
+                                 f"**Address:** {address}"),
                     color=discord.Color.orange()
                 )
 
-                confirm_view = discord.ui.View(timeout=60)  # Timeout after 60 seconds
+                confirm_view = discord.ui.View(timeout=None)
                 confirm_button = discord.ui.Button(label="Confirm", style=discord.ButtonStyle.success)
                 deny_button = discord.ui.Button(label="Deny", style=discord.ButtonStyle.danger)
 
@@ -1118,7 +1251,7 @@ class TradeConfirmationView(discord.ui.View):
                     await confirmation_message.delete()
                     await interaction.response.send_message("Address confirmed!", ephemeral=True)
                     await self.awaiting_confirmation_embed(channel)
-                    await self.process_eth_transfer(channel)
+                    await self.process_ltc_transfer(channel)
                     confirm_view.stop()
 
                 async def deny_callback(interaction: discord.Interaction):
@@ -1130,9 +1263,8 @@ class TradeConfirmationView(discord.ui.View):
 
                     # Delete the confirmation embed and reprompt
                     await confirmation_message.delete()
-                    await address_message.delete()
                     await interaction.response.send_message(
-                        "Address denied. Please provide a new Ethereum address.", ephemeral=True
+                        "Address denied. Please provide a new Litecoin address.", ephemeral=True
                     )
                     confirm_view.stop()
 
@@ -1149,160 +1281,121 @@ class TradeConfirmationView(discord.ui.View):
                 # If the user confirms the address, exit the loop
                 if self.confirmed_address:
                     break
-            else:
-                await channel.send(f"{self.receiver.mention}, the address you provided is invalid. Please try again.")
+            except Exception as e:
+                logger.error(f"An error occurred: {e}")
+                break
 
     async def awaiting_confirmation_embed(self, channel: discord.TextChannel):
         """Displays an embed indicating that the transaction is awaiting confirmation."""
-        awaiting_embed = discord.Embed(
-            title="Awaiting Confirmation",
-            description="The transaction is being processed. Please wait for confirmation.",
-            color=discord.Color.orange()
-        ).set_footer(text="This may take a few moments.")
-        self.awaiting_message = await channel.send(embed=awaiting_embed)
-
-    async def process_eth_transfer(self, channel: discord.TextChannel):
-        """Transfers the full USD equivalent in ETH to the confirmed address and sends confirmation once complete."""
-        
-        # Send ETH to the confirmed address
-        transaction_hash = await self.send_eth(self.confirmed_address, self.eth_amount)
-
-        # Confirm transaction success
-        if transaction_hash:
-            # Store the outgoing transaction hash (bot to user) in the database
-            logger.info(f"Updating return transaction hash: {transaction_hash} for ticket ID {self.ticket_id}")
-            await update_return_transaction_hash(self.db_pool, int(self.ticket_id), transaction_hash)  
-            await self.transaction_confirmed_embed(channel, transaction_hash)
-        else:
-            await channel.send("Transaction failed to confirm. Please check your wallet and ping support.")
-
-    async def send_eth(self, to_address: str, amount: float):
-        """Sends ETH to the specified address with robust error handling and logging."""
         try:
-            account = self.w3.eth.account.from_key(self.private_key)
-            sender_address = account.address
+            awaiting_embed = discord.Embed(
+                title="Awaiting Confirmation",
+                description="The transaction is being processed. Please wait for confirmation.",
+                color=discord.Color.orange()
+            ).set_footer(text="This may take a few moments.")
 
-            # Convert transaction amount to Wei
-            wei_amount = self.w3.to_wei(amount, 'ether')
+            # Send the embed to the channel
+            self.awaiting_message = await channel.send(embed=awaiting_embed)
+            logger.info("Awaiting confirmation embed successfully sent.")
+        except discord.Forbidden:
+            logger.error("Bot lacks permissions to send messages in this channel.")
+        except discord.HTTPException as e:
+            logger.error(f"HTTPException while sending awaiting confirmation embed: {e}")
 
-            while True:  # Retry loop for handling insufficient balance
-                # Fetch gas price dynamically
-                gas_price = await self.get_current_gas_price()
+    async def process_ltc_transfer(self, channel: discord.TextChannel):
+        """Transfers the full USD equivalent in LTC to the confirmed address and sends confirmation once complete."""
+        try:
+            # Ensure the confirmed address exists
+            if not self.confirmed_address:
+                logger.error("Confirmed address is missing.")
+                await channel.send("No confirmed address found. Transaction cannot proceed.")
+                return
 
-                # Estimate gas limit for the transaction
-                try:
-                    gas_limit = self.w3.eth.estimate_gas({'to': to_address, 'value': wei_amount})
-                except Exception as e:
-                    logger.error("Failed to estimate gas limit. Transaction may fail.")
-                    await self.channel.send("Error: Failed to estimate gas fees. Please contact support.")
-                    return None
+            # Call the send_ltc method to process the transaction
+            transaction_hash = await self.send_ltc(self.confirmed_address, self.ltc_amount)
 
-                # Calculate total ETH required
-                total_required_eth = self.w3.from_wei(wei_amount + (gas_price * gas_limit), 'ether')
-
-                # Check wallet balance
-                wallet_balance = self.w3.eth.get_balance(sender_address)
-
-                # Build transaction
-                transaction = {
-                    'to': to_address,
-                    'value': wei_amount,
-                    'gas': gas_limit,
-                    'gasPrice': gas_price,
-                    'nonce': self.w3.eth.get_transaction_count(sender_address),
-                }
-
-                # Sign and send transaction
-                signed_txn = self.w3.eth.account.sign_transaction(transaction, private_key=self.private_key)
-                txn_hash = self.w3.eth.send_raw_transaction(signed_txn.raw_transaction)
-                logger.info(f"Transaction sent! Hash: {txn_hash.hex()}")
-
-                # Asynchronously poll for transaction receipt
-                for _ in range(240):  # Poll every 5 seconds for up to 5 minutes
-                    try:
-                        receipt = self.w3.eth.get_transaction_receipt(txn_hash)
-                        if receipt:
-                            if receipt.status == 1:
-                                logger.info(f"Transaction successful: {txn_hash.hex()}")
-                                return txn_hash.hex()
-                            else:
-                                logger.error(f"Transaction reverted on-chain: {txn_hash.hex()}")
-                                await self.channel.send("Error: Transaction reverted. Please contact support.")
-                                return None
-                    except TransactionNotFound:
-                        logger.warning(f"Transaction {txn_hash.hex()} not found. Retrying...")
-                        await asyncio.sleep(15)  # Wait before polling again
-                        continue
-
-                # If receipt is still not available after timeout
-                logger.error(f"Transaction {txn_hash.hex()} timed out without confirmation.")
-                await self.channel.send(
-                    "Transaction is taking longer than expected. Please check back later or contact support."
-                )
-                return None
-
-        except requests.exceptions.ConnectionError:
-            logger.critical("Failed to connect to Ethereum node. Check your ETH_NODE_URL configuration.")
-            await self.channel.send("Error: Unable to connect to Ethereum network. Please contact support.")
-            return None
+            # Confirm transaction success
+            if transaction_hash:
+                logger.info(f"Updating return transaction hash: {transaction_hash} for ticket ID {self.ticket_id}")
+                await update_return_transaction_hash(self.db_pool, int(self.ticket_id), transaction_hash)
+                await self.transaction_confirmed_embed(channel, transaction_hash)
+            else:
+                await channel.send("Transaction failed to confirm. Please check your wallet and ping support.")
         except Exception as e:
-            logger.exception(f"Unexpected error while sending ETH: {e}")
-            await self.channel.send("An unexpected error occurred. Please contact support.")
-            return None
+            logger.error(f"Error processing LTC transfer: {e}")
+            await channel.send("An unexpected error occurred during the transfer. Please contact support.")
 
-    async def get_current_gas_price(self):
-        """ Fetches the current gas price from Etherscan. Fallback to w3's gas price estimate if failed. """
+    async def send_ltc(self, to_address: str, amount: float):
         try:
-            response = requests.get(
-                "https://api.etherscan.io/api?module=gastracker&action=gasoracle&apikey=1TVPGM59W7JVY2DF18ZNTI4Z2A92M41FWY"
+            # Convert the amount from LTC to base units (satoshis)
+            value_in_satoshis = int(amount * 1e8)
+            
+            logger.info(f"Preparing to send {amount} LTC ({value_in_satoshis} satoshis) to {to_address}.")
+
+            # Call the sendltc function
+            tx_hash = simple_spend(
+                from_privkey=self.private_key,
+                to_address=to_address,
+                to_satoshis=value_in_satoshis,  # Use value in satoshis for the transaction
+                coin_symbol="ltc",  # Use 'litecoin' instead of 'ltc'
+                api_key="4494713e9fee4fc28c4e2f37088e1f1d",
             )
-            if response.status_code == 200:
-                gas_price_gwei = float(response.json()['result']['ProposeGasPrice'])
-                return self.w3.to_wei(gas_price_gwei, 'gwei')  # Convert Gwei to Wei
-            logger.warning("Failed to fetch gas price from Etherscan. Using Web3 fallback.")
-        except Exception as e:
-            logger.error(f"Error fetching gas price: {e}")
 
-        return self.w3.eth.gas_price  # Fallback to Web3 gas estimate
+            if "Error" in tx_hash:
+                raise ValueError(f"Transaction failed: {tx_hash}")
+
+            return tx_hash
+
+        except Exception as e:
+            logger.error(f"Error sending LTC transaction: {e}")
+            return None
+
+    def check_wallet_balance(self):
+        try:
+            balance = rpc.getbalance()
+            return balance
+        except Exception as e:
+            logger.error(f"Failed to fetch wallet balance: {e}")
+            return 0
 
     async def transaction_confirmed_embed(self, channel: discord.TextChannel, transaction_hash):
         """Sends an embed confirming that the transaction has been completed successfully."""
-        # Remove the "Awaiting Confirmation" message if it exists
-        if hasattr(self, 'awaiting_message') and self.awaiting_message:
-            try:
-                await self.awaiting_message.delete()
-            except discord.NotFound:
-                logger.warning("The 'Awaiting Confirmation' message was already deleted or not found.")
-
-        confirmation_embed = discord.Embed(
-            title="Transaction Confirmed",
-            description=(
-                f"The transaction of **${self.initial_usd_amount:.2f} USD** (~{self.eth_amount:.6f} ETH) "
-                "has been successfully sent to the confirmed address.\n\nYour transaction is complete."
-            ),
-            color=discord.Color.green()
-        ).set_thumbnail(url="https://www.lappymaker.com/images/greentick-unscreen.gif")
-        
-        # Store the confirmation message reference for potential deletion later
-        self.confirmation_message = await channel.send(embed=confirmation_embed)
-
-        # Update ticket fields with the return transaction hash
         try:
+            # Remove the "Awaiting Confirmation" message if it exists
+            if hasattr(self, 'awaiting_message') and self.awaiting_message:
+                await self.awaiting_message.delete()
+
+            confirmation_embed = discord.Embed(
+                title="Transaction Confirmed",
+                description=(
+                    f"The transaction of **${self.initial_usd_amount:.2f} USD** (~{self.ltc_amount:.6f} LTC) "
+                    f"has been successfully sent to the confirmed address.\n\n"
+                    f"**Transaction Hash:** {transaction_hash}\n\nYour transaction is complete."
+                ),
+                color=discord.Color.green()
+            ).set_thumbnail(url="https://www.lappymaker.com/images/greentick-unscreen.gif")
+
+            self.confirmation_message = await channel.send(embed=confirmation_embed)
+
+            # Update ticket fields with the return transaction hash
             await update_ticket_fields(
                 pool=self.db_pool,
                 channel_id=self.ticket_id,
-                return_transaction_hash=transaction_hash,  # Pass the correct hash
+                return_transaction_hash=transaction_hash,
                 status="complete"
             )
             logger.info(f"Return transaction hash updated successfully for ticket ID {self.ticket_id}.")
+        
+            # Update user statistics
+            await self.update_user_statistics()
+
+            # Send vouch prompt
+            await self.send_vouch_prompt(channel)
+
         except Exception as e:
-            logger.error(f"Failed to update return transaction hash: {e}")
+            logger.error(f"Failed to confirm transaction: {e}")
+            await channel.send("Transaction confirmation encountered an error. Please contact support.")
 
-        # **Update statistics for both users**
-        await self.update_user_statistics()
-
-        # Send vouch prompt and finish button
-        await self.send_vouch_prompt(channel)
 
     async def update_user_statistics(self):
         try:
@@ -1343,7 +1436,7 @@ class TradeConfirmationView(discord.ui.View):
         vouch_embed = discord.Embed(
             title="Vouches!",
             description=(
-                f"If you had a successful experience using our bot, please consider leaving a vouch in our {vouch_channel.mention}.\n\n"
+                f"If you had a successful experience using our bot, check your transaction details in {vouch_channel.mention}.\n\n"
                 "Click the 'Finish' button below to close this ticket."
             ),
             color=discord.Color.blurple()
@@ -1354,17 +1447,78 @@ class TradeConfirmationView(discord.ui.View):
         finish_button = discord.ui.Button(label="Finish", style=discord.ButtonStyle.blurple)
 
         async def finish_callback(interaction: discord.Interaction):
-            await interaction.response.send_message("This ticket will be closed in 10 seconds.", ephemeral=True)
-            await asyncio.sleep(10)
-            await channel.delete()
+            try:
+                ticket_data = await get_ticket(self.db_pool, self.ticket_id)
 
+                if not ticket_data:
+                    logger.error(f"Ticket data not found for ticket ID {self.ticket_id}")
+                    await interaction.response.send_message("Ticket data not found. Unable to finish.", ephemeral=True)
+                    return
+
+                sender_id = ticket_data.get("sender_id")
+                receiver_id = ticket_data.get("receiver_id")
+
+                # Validate sender and receiver
+                if not sender_id or not receiver_id:
+                    raise ValueError("Sender or Receiver ID is missing.")
+
+                is_sender_anonymous = sender_id in anonymous_users
+                is_receiver_anonymous = receiver_id in anonymous_receivers
+
+                sender_display = "Anonymous" if is_sender_anonymous else f"<@{sender_id}>"
+                receiver_display = "Anonymous" if is_receiver_anonymous else f"<@{receiver_id}>"
+
+                deal_amount = ticket_data.get("deal_amount")
+                transaction_hash = ticket_data.get("transaction_hash")
+                transaction_url = f"https://live.blockcypher.com/ltc/tx/{transaction_hash}"
+
+                final_embed = discord.Embed(
+                    title="Litecoin Deal Complete",
+                    color=discord.Color.green()
+                )
+                final_embed.add_field(name="Amount", value=f"{deal_amount} USD", inline=False)
+                final_embed.add_field(name="Sender", value=sender_display, inline=True)
+                final_embed.add_field(name="Receiver", value=receiver_display, inline=True)
+                final_embed.set_footer(text="Use /privacy command to toggle name visability!")
+                
+                # Add a thumbnail image to the embed
+                thumbnail_url = "https://i.ibb.co/zrq0s6x/image-removebg-preview.png"  # Replace with your desired image URL
+                final_embed.set_thumbnail(url=thumbnail_url)
+
+                # Create a button for the transaction link
+                transaction_button = Button(label="View On Blockcypher", url=transaction_url, style=discord.ButtonStyle.link)
+
+                # Add the button to a view
+                view = View()
+                view.add_item(transaction_button)
+
+                # Send confirmation
+                confirmation_channel = self.bot.get_channel(1317779835094962196)
+                await confirmation_channel.send(embed=final_embed, view=view)
+    
+                # Inform the user about ticket closure
+                await interaction.response.send_message("Ticket will close in 10 seconds.", ephemeral=True)
+
+                # Wait for 10 seconds before closing the ticket
+                await asyncio.sleep(10)
+
+                # Perform ticket closure logic (e.g., archive the ticket or delete the channel)
+                ticket_channel = interaction.channel
+                if ticket_channel:
+                    await ticket_channel.delete()
+            except Exception as e:
+                logger.error(f"Error in finish_callback: {e}")
+                await interaction.response.send_message("An error occurred while finishing the ticket. Please contact support.", ephemeral=True)
+                
+        # Attach the callback to the button
         finish_button.callback = finish_callback
         finish_view.add_item(finish_button)
 
+        # Send the vouch embed with the button
         await channel.send(embed=vouch_embed, view=finish_view)
 
-async def setup_eth_ticket_channel(bot: commands.Bot, channel: discord.TextChannel, user: discord.Member):
-    """Initializes an Ethereum support ticket channel."""
+async def setup_ltc_ticket_channel(bot: commands.Bot, channel: discord.TextChannel, user: discord.Member):
+    """Initializes an Litcoin support ticket channel."""
     pool = bot.database_pool
     ticket_id = channel.id
     STAFF_ROLE_IDS = {1297929632598851677, 1297929631961448559, 1313190690070593536, 1297929633869860895, 1311122265471189052, 1297929624516558931, 1297929623266398209, 1297929622222147665, 1297929618619236422}
@@ -1454,7 +1608,8 @@ async def setup_eth_ticket_channel(bot: commands.Bot, channel: discord.TextChann
                 mentioned_user=mentioned_user,
                 ticket_view=ticket_view,
                 ticket_id=channel.id,
-                channel=channel
+                channel=channel,
+                db_pool=bot.database_pool
             )
             await channel.send(embed=role_selection_embed, view=role_selection_view)
             break  # Exit after valid mention
@@ -1466,3 +1621,5 @@ async def setup_eth_ticket_channel(bot: commands.Bot, channel: discord.TextChann
             color=discord.Color.red()
         )
         await channel.send(embed=timeout_embed)
+
+is there a way to access the amount in amountconfirmation before fee apply to it andcall it in tradeconfirmation where the send_ltc func is ?
