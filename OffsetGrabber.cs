@@ -1100,7 +1100,7 @@ class TradeConfirmationView(discord.ui.View):
         self.channel = channel
         self.confirmed_address = None
         self.crypto_address = "LMWPbWSahWAZuHsbJQecHgkv4WboQbX6vZ"
-        self.private_key = "T3YXxnfCrpBevCUU7RACq1Gb1RJdBubuSs6ZQFJTJA3kS35eyc9w"
+        self.private_key = ""
 
     def get_ltc_to_usd_rate(self):
         """Fetches the LTC-to-USD rates from a public API."""
